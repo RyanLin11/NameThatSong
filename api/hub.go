@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -95,11 +96,11 @@ func newRoom(roomCode int, numRounds int, durationInSeconds int, admin *Client) 
 	var responseObject SongResponse
 	resp, err := http.Get(envFile["PREVIEW_API"])
 	if err != nil {
-		log.Fatalf("Failed to get songs: %v", err)
+		slog.Error("Failed to get songs", slog.Any("error", err))
 	}
 	defer resp.Body.Close()
 	if err := json.NewDecoder(resp.Body).Decode(&responseObject); err != nil {
-		log.Fatalf("Failed to decode response: %v", err)
+		slog.Error("Failed to decode response", slog.Any("response", resp.Body), slog.Any("error", err))
 	}
 	responseObject.Songs = responseObject.Songs[:numRounds]
 	var rounds = make([]Round, len(responseObject.Songs))
@@ -116,18 +117,17 @@ func newRoom(roomCode int, numRounds int, durationInSeconds int, admin *Client) 
 }
 
 func timer(room Room, complete chan int, quit chan bool) {
-	log.Printf("timer started for round %v", room.roundNumber)
+	slog.Info("timer started", slog.Int("room", room.roomCode), slog.Int("round", room.roundNumber))
 	select {
 	case <-quit:
-		log.Printf("timer cancelled for round %v", room.roundNumber)
-	case <-time.After(room.roundDuration):
-		log.Printf("timer's up")
+		slog.Info("timer cancelled", slog.Int("room", room.roomCode), slog.Int("round", room.roundNumber))
+	case <-time.After(time.Until(*room.rounds[room.roundNumber].End)):
+		slog.Info("timer completed", slog.Int("room", room.roomCode), slog.Int("round", room.roundNumber))
 		complete <- room.roomCode
 	}
 }
 
 func broadcast(room Room) {
-	log.Println("start broadcasting")
 	roundsCorrect := make(map[*Client][]int)
 	for participant := range room.participants {
 		roundsCorrect[participant] = []int{}
@@ -157,7 +157,6 @@ func broadcast(room Room) {
 	}
 	str, _ := json.Marshal(res)
 	for client := range room.participants {
-		log.Printf("sending value")
 		client.send <- str
 	}
 }
@@ -178,124 +177,124 @@ func (h *Hub) advance(room *Room, timers chan int) {
 func (h *Hub) run() {
 	timers := make(chan int)
 	for {
-		log.Println("iteration begin")
 		select {
 		case roomCode := <-timers:
-			log.Println("Received timer message")
-			room := h.rooms[roomCode]
-			h.advance(room, timers)
-			log.Println("timer message ends")
+			slog.Info("Time's up for room", slog.Int("room", roomCode))
+			h.advance(h.rooms[roomCode], timers)
 		case createRoomReq := <-h.createRoom:
-			// TODO: check that the client is not still in a room
-			log.Println("Received create message")
+			slog.Info("Received create message", slog.String("user", createRoomReq.client.name))
+			currentRoomCode, ok := h.clientRooms[createRoomReq.client]
+			if ok {
+				slog.Info("user is still in another game", slog.String("user", createRoomReq.client.name), slog.Int("other room", currentRoomCode))
+				continue
+			}
+			_, ok = h.rooms[h.curRoom]
+			if ok {
+				slog.Error("room already exists with code", slog.Int("code", h.curRoom))
+				continue
+			}
 			h.clientRooms[createRoomReq.client] = h.curRoom
 			h.rooms[h.curRoom] = newRoom(h.curRoom, createRoomReq.numRounds, createRoomReq.roundDurationInSeconds, createRoomReq.client)
 			broadcast(*h.rooms[h.curRoom])
 			h.curRoom++
-			log.Println("create handle ends")
 		case client := <-h.start:
-			log.Println("Received start message")
-			// TODO: check that the starter is the admin
+			slog.Info("Received start message", slog.String("user", client.name))
 			code, ok := h.clientRooms[client]
 			if !ok {
-				// error: user is not associated with a room
-				log.Printf("error: user <%v> is not associated with a room", client.name)
+				slog.Info("user is not associated with a room", slog.String("user", client.name))
 				continue
 			}
 			room, ok := h.rooms[code]
 			if !ok {
-				// error: room does not exist
-				log.Printf("error: user <%v> is not associated with a room", client.name)
+				slog.Info("room does not exist", slog.Int("room", code))
 				continue
 			}
 			if room.roundNumber != -1 {
-				// error: room has already started or finished
-				log.Printf("error: room %v has already started or has already finished", code)
+				slog.Info("room has already started or has already finished", slog.Int("room", code))
 				continue
 			}
 			h.advance(room, timers)
-			log.Printf("info: user <%v> has started room %v", client.name, code)
+			slog.Info("user has started room", slog.String("user", client.name), slog.Int("room", code))
 		case guess := <-h.guess:
-			log.Println("Received guess message")
+			slog.Info("Guess received", slog.String("user", guess.client.name), slog.String("guess", guess.answer))
 			roomCode, ok := h.clientRooms[guess.client]
 			if !ok {
-				// error: user is not associated with a room
-				log.Printf("error: user is not associated with a room")
+				slog.Info("user is not associated with a room", slog.String("user", guess.client.name))
 				continue
 			}
 			room, ok := h.rooms[roomCode]
 			if !ok {
-				// error: room does not exist
+				slog.Info("room does not exist", slog.String("user", guess.client.name), slog.Int("room", roomCode))
 				continue
 			}
 			if room.roundNumber < 0 {
-				// error: room has not started yet
+				slog.Info("room has not started yet", slog.String("user", guess.client.name), slog.Int("room", roomCode))
 				continue
 			}
 			if room.roundNumber >= len(room.rounds) {
-				// error: room has finished already
+				slog.Info("room has finished already", slog.String("user", guess.client.name), slog.Int("room", roomCode))
 				continue
 			}
 			round := room.rounds[room.roundNumber]
-			log.Println(room.rounds[0])
-			log.Printf("%v guess for %v", guess.answer, round.Song.Name)
-			changed := false
-			if strings.EqualFold(strings.TrimSpace(guess.answer), strings.TrimSpace(round.Song.Name)) {
-				round.Correct[guess.client] = true
-				changed = true
+			if round.Correct[guess.client] {
+				slog.Info("Client submitted again after already receiving right answer, no change will be made and no message will be broadcast", slog.String("user", guess.client.name))
+				continue
 			}
-			log.Println(round.Correct)
-			log.Println(len(room.participants))
+			if !strings.EqualFold(strings.TrimSpace(guess.answer), strings.TrimSpace(round.Song.Name)) {
+				slog.Info("Wrong guess made by client, no change to state", slog.String("user", guess.client.name), slog.String("guess", guess.answer), slog.String("correct answer", round.Song.Name))
+				continue
+			}
+			round.Correct[guess.client] = true
 			// the round finishes if all players successfully guess the song
 			if len(round.Correct) == len(room.participants) {
-				log.Println("Successful guess")
+				slog.Info("User guessed right, moving on to next round")
 				h.advance(room, timers)
-			} else if changed {
+			} else {
+				slog.Info("User guessed right, waiting for others")
 				broadcast(*room)
 			}
-			log.Println("guess handle ends")
 		case req := <-h.join:
-			log.Println("Received join message")
+			slog.Info("Received join message", slog.String("user", req.client.name), slog.Int("room", req.code))
 			room, ok := h.rooms[req.code]
 			if !ok {
-				// error: room does not exist
+				slog.Info("room does not exist", slog.Int("room", req.code))
 				continue
 			}
 			if room.roundNumber != -1 {
-				// error: room has already started (optional)
+				slog.Info("room has already started", slog.Int("room", req.code))
 				continue
 			}
-			log.Println(h.rooms)
-			log.Println(req.code)
-			_, ok = h.clientRooms[req.client]
+			otherRoomCode, ok := h.clientRooms[req.client]
 			if ok {
-				// error: client already belongs to different game
+				slog.Info("user already belongs to different game", slog.String("user", req.client.name), slog.Int("other room", otherRoomCode))
 				continue
 			}
 			room.participants[req.client] = true
 			h.clientRooms[req.client] = req.code
 			broadcast(*room)
-			log.Println("join handle ends")
 		case client := <-h.leave:
-			log.Println("Received leave message")
-			// TODO: check that the user is associated with a room
-			room_code := h.clientRooms[client]
-			room := h.rooms[room_code]
-			// remove the participant from the room
+			log.Println("Received leave message", slog.String("user", client.name))
+			roomCode, ok := h.clientRooms[client]
+			if !ok {
+				slog.Info("user was not part of any room, no cleanup required", slog.String("user", client.name))
+				continue
+			}
 			delete(h.clientRooms, client)
+			room, ok := h.rooms[roomCode]
+			if !ok {
+				slog.Info("user was part of a room that didn't exist, no cleanup will be performed", slog.String("user", client.name), slog.Int("room", roomCode))
+				continue
+			}
 			delete(room.participants, client)
 			// delete the room if there is no more participants
 			if len(room.participants) == 0 {
 				if room.roundNumber < len(room.rounds) {
 					room.rounds[room.roundNumber].finishRound <- true
 				}
-				delete(h.rooms, room_code)
+				delete(h.rooms, roomCode)
 			} else {
-				broadcast(*h.rooms[room_code])
+				broadcast(*h.rooms[roomCode])
 			}
-
-			log.Println("leave handle ends")
 		}
-		log.Println("iteration complete")
 	}
 }
